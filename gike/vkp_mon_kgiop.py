@@ -5,6 +5,7 @@ import sqlite3
 import pandas as pd
 import ocrmypdf
 import user_data # Заголовки запроса, включая cookies
+import json
 
 from gpt4all import GPT4All #Поддержка ИИ
 
@@ -56,19 +57,6 @@ def setup_logging():
     
     return logger
 
-logger = setup_logging()
-
-keywords = ["предусматривает", "проектом", "собственник", "заказчик", "вывод"]
-
-logger.info('Загрузка модели')
-
-# Путь к модели также берётся из файла user_data
-try:
-    model = GPT4All(user_data.model_path, allow_download=False)
-    logger.info('Загрузка модели выполнена')
-except Exception as e:
-    logger.error(f'Ошибка загрузки модели: {str(e)}')
-    raise
 
 ###
 ### Работа с базой данных    
@@ -198,67 +186,83 @@ def get_gpt_text(text):
 ### Построение карты
 ###
 
+
 def get_kadastr(text):
     try:
-        # Создаем папку для карт, если ее нет
         os.makedirs("maps", exist_ok=True)
         
-        gdf_merged = gpd.GeoDataFrame()
-        kadastr = re.findall(r'\d{1,10}\:\d{1,10}\:\d{1,10}\:\d{1,10}', text)
+        # Извлекаем кадастровые номера из текста
+        kadastr = re.findall(r'\d{1,2}:\d{1,2}:\d{1,7}:\d{1,7}', text)
+        kadastr = list(set(kadastr))  # Удаляем дубликаты
+        
         logger.info(f"Найдены кадастровые номера: {kadastr}")
-
+        
         if not kadastr:
             logger.info("Кадастровые номера не найдены")
             return None
 
+        gdf_merged = gpd.GeoDataFrame()
+
         for kn in kadastr:
             try:
-                # Используем API Росреестра для получения координат
-                url = f"https://pkk.rosreestr.ru/api/features/1/{kn}"
-                response = requests.get(url, timeout=10, verify=False)
-                response.raise_for_status()
-                data = response.json()
+                logger.info(f"Обработка кадастрового номера: {kn}")
                 
-                # Получаем координаты из ответа API
-                if 'feature' in data and 'geom' in data['feature']:
-                    coords = data['feature']['geom']['coordinates']
+                # Получаем данные через rosreestr2coord
+                area = Area(kn, with_proxy=True)
+                coords = area.to_geojson_poly()
+                coords=json.loads(coords)
+                #Проверяем, идет ли речь о точке или полигоне
+                if isinstance(coords['geometry']['coordinates'][0], list):
+                    coords=coords['geometry']['coordinates'][0]
+                    polygon_geom = Polygon(coords)
+                else: 
+                    coords=coords['geometry']['coordinates']
+                    coords[0], coords[1] = coords[0]/100000, coords[1]/100000
+                    polygon_geom = Point(coords)
+
+                
+                # Создаем GeoDataFrame из полигона
+                
                     
-                    # Обрабатываем разные типы геометрий
-                    if isinstance(coords[0][0], list):  # Полигон
-                        polygon_geom = Polygon(coords[0])
-                    else:  # Точка
-                        point_geom = Point(coords[0], coords[1])
-                        # Создаем небольшой полигон вокруг точки для лучшей визуализации
-                        polygon_geom = point_geom.buffer(0.0001)
-                    
-                    gdf = gpd.GeoDataFrame(index=[0], crs='epsg:4326', geometry=[polygon_geom]) 
-                    gdf_merged = pd.concat([gdf_merged, gdf], ignore_index=True)
+                gdf = gpd.GeoDataFrame(index=[0], crs='epsg:4326', geometry=[polygon_geom]) 
+                gdf_merged = pd.concat([gdf_merged, gdf], ignore_index=True)
                 
             except Exception as e:
                 logger.error(f"Ошибка обработки кадастрового номера {kn}: {str(e)}")
                 continue
-        
+
         if gdf_merged.empty:
             logger.info("Не удалось получить геоданные по кадастровым номерам")
             return None
             
-        gdf = gdf_merged.set_geometry('geometry')
-
         # Создаем карту
-        fig, ax = plt.subplots(figsize=(10, 10))
-        gdf.plot(ax=ax, alpha=0.5, edgecolor='red')
-        cx.add_basemap(ax=ax, crs=gdf.crs.to_string(), source=cx.providers.OpenStreetMap.Mapnik, zoom=16)
-        
-        filename = f"{uuid.uuid4()}.png"  
-        plt.savefig(f"maps/{filename}", bbox_inches='tight', dpi=100)
-        plt.close()
-        
-        logger.info(f"Карта сохранена как: {filename}")
-        return filename
+        try:
+            fig, ax = plt.subplots(figsize=(10, 10))
+            gdf_merged.plot(ax=ax, alpha=0.5, edgecolor='red')
+            
+            # Добавляем подложку карты
+            try:
+                cx.add_basemap(ax, crs=gdf_merged.crs.to_string(), 
+                             source=cx.providers.OpenStreetMap.Mapnik, zoom=18)
+            except Exception as map_error:
+                logger.warning(f"Ошибка загрузки подложки карты: {str(map_error)}")
+                # Рисуем без подложки, если не удалось загрузить
+            
+            filename = f"{uuid.uuid4()}.png"
+            plt.savefig(f"maps/{filename}", bbox_inches='tight', dpi=100)
+            plt.close()
+            
+            logger.info(f"Карта сохранена как: {filename}")
+            return filename
+            
+        except Exception as e:
+            logger.error(f"Ошибка при создании карты: {str(e)}")
+            return None
+            
     except Exception as e:
-        logger.error(f"Ошибка при создании карты: {str(e)}")
+        logger.error(f"Критическая ошибка в функции get_kadastr: {str(e)}")
         return None
-
+    
 ###
 ### Извлечение изображений из PDF и создание миниатюр
 ###
@@ -369,147 +373,137 @@ def getgike(link, headers, short_link=''):
         logger.error(f"Ошибка в функции getgike: {str(e)}")
         return "", None
 
-# Создаем базу данных и таблицу, если их нет
-try:
-    with sqlite3.connect("kgiop_db.db") as con:
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS kgiop (
-                date TEXT,
-                link TEXT,
-                summary TEXT,
-                text TEXT,
-                map_filename TEXT,
-                thumb_filename TEXT
-            );
-        """)
-    logger.info("База данных инициализирована")
-except Exception as e:
-    logger.error(f"Ошибка инициализации базы данных: {str(e)}")
-    raise
 
-headers = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0'
-}
-   
-logger.info('Запрашиваем страницу экспертиз КГИОП')
-    
-# Получаем нынешний год для подстановки в ссылку
-dt = datetime.datetime.now()
-year_only = dt.year
-    
-try:
-    response = requests.get(
-        f'https://kgiop.gov.spb.ru/deyatelnost/zaklyucheniya-gosudarstvennyh-istoriko-kulturnyh-ekspertiz/gosudarstvennye-istoriko-kulturnye-ekspertizy-za-{year_only}-g/',
-        headers=headers,
-        verify=False
-    )
-    response.raise_for_status()
-    response = response.text
-    soup = BeautifulSoup(response, "lxml")
-    eventtypesall = soup.find_all('a')
-    logger.info(f"Список из {len(eventtypesall)} ссылок получен. Начинаем загрузку экспертиз")
-    sleep(1)
+if __name__ == "__main__":
 
-    index = 0
-    for i in eventtypesall: 
-        link_capt = '' # Титул экспертизы     
-        if "Срок рассмотрения обращений" in i.text:
-            link_capt = 'Экспертиза ' + i.find_parent('td').find_previous_sibling('td').text + ' (часть составной экспертизы)'    
-        if 'disk.yandex.ru' in i['href']: # если файл выложен на яндекс-диск
-            index += 1
-            if index > 19:
-                logger.info("Достигнут лимит в 20 экспертиз за один запуск")
-                break
-            logger.info(f'Загружаем экспертизу № {index}')
-            logger.info(i.text)
-            apilink = f'https://cloud-api.yandex.net/v1/disk/public/resources/download?public_key={i["href"]}'
-            response_json = requests.get(apilink).json()
-            link = response_json.get("href")
-            
-            # Есть ли уже в архиве этот документ?
-            if indb(i['href']):
-                logger.info(f"Документ по ссылке {link} уже есть в архиве, пропускаем его")
-                continue
+    logger = setup_logging()
+
+    keywords = ["предусматривает", "проектом", "собственник", "заказчик", "вывод"]
+
+    logger.info('Загрузка модели')
+
+    # Путь к модели также берётся из файла user_data
+    try:
+        model = GPT4All(user_data.model_path, allow_download=False)
+        logger.info('Загрузка модели выполнена')
+    except Exception as e:
+        logger.error(f'Ошибка загрузки модели: {str(e)}')
+        raise
         
-            logger.info(link)
-            link_caption = i.text
+    # Создаем базу данных и таблицу, если их нет
+    try:
+        with sqlite3.connect("kgiop_db.db") as con:
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS kgiop (
+                    date TEXT,
+                    link TEXT,
+                    summary TEXT,
+                    text TEXT,
+                    map_filename TEXT,
+                    thumb_filename TEXT
+                );
+            """)
+        logger.info("База данных инициализирована")
+    except Exception as e:
+        logger.error(f"Ошибка инициализации базы данных: {str(e)}")
+        raise
 
-            text, thumb_filename = getgike(link, headers)
-            summary = extract_text_fragments(text, keywords)
-            text4gpt = text[:1000] + summary[:500] + summary[-500:]
-            text_result = get_gpt_text(text4gpt)
-            logger.info(text_result)
-            
-            map_filename = get_kadastr(text)
-            logger.info(f"Карта сохранена как: {map_filename}")
-            logger.info(f"Миниатюры сохранены как: {thumb_filename}")
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0'
+    }
+    
+    logger.info('Запрашиваем страницу экспертиз КГИОП')
         
-            todb(i['href'], text_result, text, map_filename, thumb_filename)
+    # Получаем нынешний год для подстановки в ссылку
+    dt = datetime.datetime.now()
+    year_only = dt.year
+        
+    try:
+        response = requests.get(
+            f'https://kgiop.gov.spb.ru/deyatelnost/zaklyucheniya-gosudarstvennyh-istoriko-kulturnyh-ekspertiz/gosudarstvennye-istoriko-kulturnye-ekspertizy-za-{year_only}-g/',
+            headers=headers,
+            verify=False
+        )
+        response.raise_for_status()
+        response = response.text
+        soup = BeautifulSoup(response, "lxml")
+        eventtypesall = soup.find_all('a')
+        logger.info(f"Список из {len(eventtypesall)} ссылок получен. Начинаем загрузку экспертиз")
+        sleep(1)
+
+        index = 0
+        for i in eventtypesall: 
+            link_capt = '' # Титул экспертизы     
+            if "Срок рассмотрения обращений" in i.text:
+                link_capt = 'Экспертиза ' + i.find_parent('td').find_previous_sibling('td').text + ' (часть составной экспертизы)'    
+            if 'disk.yandex.ru' in i['href']: # если файл выложен на яндекс-диск
+                index += 1
+                if index > 19:
+                    logger.info("Достигнут лимит в 20 экспертиз за один запуск")
+                    break
+                logger.info(f'Загружаем экспертизу № {index}')
+                logger.info(i.text)
+                apilink = f'https://cloud-api.yandex.net/v1/disk/public/resources/download?public_key={i["href"]}'
+                response_json = requests.get(apilink).json()
+                link = response_json.get("href")
                 
-            logger.info('Ожидание следующего запроса к сайту')
-            sleep(randint(5,10))
+                # Есть ли уже в архиве этот документ?
+                if indb(i['href']):
+                    logger.info(f"Документ по ссылке {link} уже есть в архиве, пропускаем его")
+                    continue
             
-        elif '/media/uploads/userfiles/' in i['href']: # если файл выложен на сайте кгиоп
-            index += 1
-            if index > 19:
-                logger.info("Достигнут лимит в 20 экспертиз за один запуск")
-                break
-            logger.info(f'Загружаем экспертизу № {index}')
-            link = "https://kgiop.gov.spb.ru" + i['href']
-        
-            # Есть ли уже в архиве этот документ?
-            if indb(link): 
-                logger.info(f"Документ по ссылке {link} уже есть в архиве, пропускаем его")
-                continue
+                logger.info(link)
+                link_caption = i.text
 
-            text, thumb_filename = getgike(link, headers=headers)
-            summary = extract_text_fragments(text, keywords)
-            text4gpt = text[:1000] + summary[:500] + summary[-500:]
-            text_result = get_gpt_text(text4gpt)
-            logger.info(text_result)
-
-            map_filename = get_kadastr(text)
-            logger.info(f"Карта сохранена как: {map_filename}")
-            logger.info(f"Миниатюры сохранены как: {thumb_filename}")
+                text, thumb_filename = getgike(link, headers)
+                summary = extract_text_fragments(text, keywords)
+                text4gpt = text[:1000] + summary[:500] + summary[-500:]
+                text_result = get_gpt_text(text4gpt)
+                logger.info(text_result)
+                
+                map_filename = get_kadastr(text)
+                logger.info(f"Карта сохранена как: {map_filename}")
+                logger.info(f"Миниатюры сохранены как: {thumb_filename}")
             
-            todb(link, text_result, text, map_filename, thumb_filename)
-            if link_capt == '': 
-                link_capt = 'Экспертиза ' + i.text
-
-            logger.info('Ожидание следующего запроса к сайту')
-            sleep(randint(2,4))
+                todb(i['href'], text_result, text, map_filename, thumb_filename)
+                    
+                logger.info('Ожидание следующего запроса к сайту')
+                sleep(randint(5,10))
+                
+            elif '/media/uploads/userfiles/' in i['href']: # если файл выложен на сайте кгиоп
+                index += 1
+                if index > 19:
+                    logger.info("Достигнут лимит в 20 экспертиз за один запуск")
+                    break
+                logger.info(f'Загружаем экспертизу № {index}')
+                link = "https://kgiop.gov.spb.ru" + i['href']
             
-except Exception as e:
-    logger.error(f"Критическая ошибка в основном цикле: {str(e)}")
-    logger.error(traceback.format_exc())
-    raise
+                # Есть ли уже в архиве этот документ?
+                if indb(link): 
+                    logger.info(f"Документ по ссылке {link} уже есть в архиве, пропускаем его")
+                    continue
 
-logger.info("Программа завершена успешно")
+                text, thumb_filename = getgike(link, headers=headers)
+                summary = extract_text_fragments(text, keywords)
+                text4gpt = text[:1000] + summary[:500] + summary[-500:]
+                text_result = get_gpt_text(text4gpt)
+                logger.info(text_result)
 
+                map_filename = get_kadastr(text)
+                logger.info(f"Карта сохранена как: {map_filename}")
+                logger.info(f"Миниатюры сохранены как: {thumb_filename}")
+                
+                todb(link, text_result, text, map_filename, thumb_filename)
+                if link_capt == '': 
+                    link_capt = 'Экспертиза ' + i.text
 
-# Тестовые функции
-def run_tests():
-    """Запуск тестов основных функций"""
-    logger.info("Запуск тестов...")
-    
-    # Тест функции extract_text_fragments
-    test_text = "Проектом предусматривается реконструкция здания. Собственник объекта - ООО 'Ромашка'. Вывод экспертизы положительный."
-    fragments = extract_text_fragments(test_text, keywords)
-    assert "Проектом предусматривается реконструкция здания" in fragments, "Тест extract_text_fragments не пройден"
-    assert "Собственник объекта - ООО 'Ромашка'" in fragments, "Тест extract_text_fragments не пройден"
-    assert "Вывод экспертизы положительный" in fragments, "Тест extract_text_fragments не пройден"
-    
-    # Тест функции indb
-    with sqlite3.connect(":memory:") as con:
-        con.execute("CREATE TABLE kgiop (link TEXT);")
-        con.execute("INSERT INTO kgiop VALUES ('test_link');")
-        assert indb("test_link"), "Тест indb (положительный) не пройден"
-        assert not indb("non_existent_link"), "Тест indb (отрицательный) не пройден"
-    
-    logger.info("Все тесты пройдены успешно")
+                logger.info('Ожидание следующего запроса к сайту')
+                sleep(randint(2,4))
+                
+    except Exception as e:
+        logger.error(f"Критическая ошибка в основном цикле: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise
 
-try:
-    run_tests()
-except AssertionError as e:
-    logger.error(f"Ошибка в тестах: {str(e)}")
-    raise
+    logger.info("Программа завершена успешно")
+

@@ -2,7 +2,10 @@
 *.pdf
 *.html
 *.log
+*.json
+*.txt
 user_data.py
+\tests
 \venv
 \__pycache__
 \thumbnails
