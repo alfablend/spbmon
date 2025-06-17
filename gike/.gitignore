@@ -1,0 +1,9 @@
+*.db
+*.pdf
+*.html
+*.log
+user_data.py
+\venv
+\__pycache__
+\thumbnails
+\maps

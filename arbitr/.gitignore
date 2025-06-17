@@ -1,0 +1,9 @@
+*.csv
+*.log
+*.pdf
+user_data.py
+# venv
+myenv/
+# Python cache
+__pycache__/
+*.py[cod]  # Игнорирует .pyc, .pyo, .pyd
