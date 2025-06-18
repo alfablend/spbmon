@@ -32,6 +32,7 @@ import io
 
 from pypdf import PdfReader
 from pdf2image import convert_from_path
+from rosreestr2coord import Area
 
 # Настройка логирования
 def setup_logging():
