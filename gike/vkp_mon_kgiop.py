@@ -324,50 +324,134 @@ def extract_images_and_create_thumbnail(pdf_path):
 ### Код загрузки ГИКЭ
 ###
 def getgike(link, headers, short_link=''):
-    try:
-        with requests.get(link, headers=headers, stream=True, timeout=10, verify=False) as pdf_bytes:
-            pdf_bytes.raise_for_status()
-            with open('temp.pdf', 'wb') as p:
-                pbar = tqdm(total=int(pdf_bytes.headers['Content-Length']))
-                for chunk in pdf_bytes.iter_content(chunk_size=8192):
-                    if chunk:  # filter out keep-alive new chunks
-                        p.write(chunk)
-                        pbar.update(len(chunk))
-                p.seek(0, os.SEEK_END)
-                
-                #Распознание PDF
+    """
+    Загружает PDF-файл по ссылке, выполняет OCR (при необходимости),
+    извлекает текст и создает миниатюры изображений.
+    
+    Args:
+        link (str): Ссылка на PDF-файл
+        headers (dict): Заголовки HTTP-запроса
+        short_link (str): Короткое название ссылки для логов (опционально)
+    
+    Returns:
+        tuple: (текст из PDF, имя файла миниатюры) или ("", None) при ошибке
+    """
+    max_retries = 3
+    retry_delay = 5  # секунды между попытками
+    temp_pdf = 'temp.pdf'
+    temp_ocr = 'tempocr.pdf'
+    
+    def cleanup():
+        """Удаление временных файлов"""
+        for f in [temp_pdf, temp_ocr]:
+            if os.path.exists(f):
                 try:
-                    ocrmypdf.ocr('temp.pdf', 'tempocr.pdf', l='rus', pages='1-50', output_type='pdf', optimize=0) 
-                    docpath = 'tempocr.pdf' #имя файла, из которого будем извлекать текст
-                    logger.info("PDF успешно распознан")
-                except (ocrmypdf.exceptions.PriorOcrFoundError, ocrmypdf.exceptions.TaggedPDFError) as e:
-                    logger.info("OCR не требуется.")
-                    docpath = 'temp.pdf'
-                except Exception as e: 
-                    logger.error(f"Ошибка в модуле распознавания: {str(e)}")
-                    docpath = 'temp.pdf'
-                
-                # Извлекаем изображения и создаем миниатюры
-                thumb_filename = extract_images_and_create_thumbnail(docpath)
-                
-                read_pdf = PdfReader(docpath)
-                count = len(read_pdf.pages)
-                pages_txt = ''
+                    os.remove(f)
+                except Exception as e:
+                    logger.warning(f"Не удалось удалить файл {f}: {str(e)}")
 
-                for x in range(count)[:200]:
-                    page = read_pdf.pages[x]    
-                    try:
-                        page_text = page.extract_text()
-                    except Exception as e:
-                        logger.warning(f"Ошибка извлечения текста со страницы {x}: {str(e)}")
-                        page_text = ''
-                    pages_txt = pages_txt + page_text
-        
-        logger.info(f"Текст из PDF извлечен, длина: {len(pages_txt)} символов")
-        return pages_txt, thumb_filename
-    except Exception as e:
-        logger.error(f"Ошибка в функции getgike: {str(e)}")
-        return "", None
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Попытка {attempt + 1}/{max_retries} загрузки {short_link or link}")
+            
+            # Загрузка PDF с обработкой больших файлов
+            with requests.get(link, headers=headers, stream=True, timeout=30, verify=False) as pdf_bytes:
+                pdf_bytes.raise_for_status()
+                
+                # Определение размера файла для прогресс-бара
+                total_size = int(pdf_bytes.headers.get('Content-Length', 0))
+                if total_size > 100 * 1024 * 1024:  # >100MB
+                    logger.warning(f"Большой файл ({total_size/1024/1024:.1f} MB)")
+                
+                # Сохранение PDF
+                with open(temp_pdf, 'wb') as p:
+                    with tqdm(total=total_size, unit='B', unit_scale=True, 
+                             desc=f"Загрузка {os.path.basename(link)[:30]}") as pbar:
+                        for chunk in pdf_bytes.iter_content(chunk_size=8192):
+                            if chunk:
+                                p.write(chunk)
+                                pbar.update(len(chunk))
+                
+                # Проверка что файл не пустой
+                if os.path.getsize(temp_pdf) == 0:
+                    raise ValueError("Загружен пустой файл")
+
+                # Попытка OCR (если нужно)
+                docpath = temp_pdf
+                try:
+                    logger.info("Попытка OCR...")
+                    ocrmypdf.ocr(
+                        temp_pdf, 
+                        temp_ocr, 
+                        language='rus', 
+                        pages='1-50', 
+                        output_type='pdf', 
+                        optimize=0,
+                        force_ocr=False  # Не переделывать если уже есть текст
+                    )
+                    docpath = temp_ocr
+                    logger.info("OCR успешно выполнен")
+                except (ocrmypdf.exceptions.PriorOcrFoundError, 
+                       ocrmypdf.exceptions.TaggedPDFError) as e:
+                    logger.info(f"OCR не требуется: {str(e)}")
+                except Exception as e:
+                    logger.error(f"Ошибка OCR: {str(e)}")
+                
+                # Извлечение миниатюр
+                thumb_filename = None
+                try:
+                    thumb_filename = extract_images_and_create_thumbnail(docpath)
+                except Exception as e:
+                    logger.error(f"Ошибка создания миниатюр: {str(e)}")
+                
+                # Извлечение текста
+                pages_txt = ""
+                try:
+                    read_pdf = PdfReader(docpath)
+                    total_pages = len(read_pdf.pages)
+                    max_pages = min(200, total_pages)  # Ограничение на кол-во страниц
+                    
+                    logger.info(f"Извлечение текста из {max_pages} страниц...")
+                    for x in range(max_pages):
+                        try:
+                            page = read_pdf.pages[x]
+                            page_text = page.extract_text() or ""
+                            pages_txt += page_text + "\n"
+                        except Exception as e:
+                            logger.warning(f"Ошибка страницы {x + 1}: {str(e)}")
+                    
+                    logger.info(f"Извлечено {len(pages_txt)} символов")
+                except Exception as e:
+                    logger.error(f"Ошибка чтения PDF: {str(e)}")
+                    raise
+                
+                # Очистка временных файлов
+                cleanup()
+                
+                return pages_txt, thumb_filename
+                
+        except requests.exceptions.ConnectionError as e:
+            logger.warning(f"Ошибка соединения: {str(e)}")
+            if attempt < max_retries - 1:
+                sleep_time = retry_delay * (attempt + 1)
+                logger.info(f"Повтор через {sleep_time} сек...")
+                sleep(sleep_time)
+                continue
+            logger.error("Превышено количество попыток")
+            cleanup()
+            return "", None
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Ошибка запроса: {str(e)}")
+            cleanup()
+            return "", None
+            
+        except Exception as e:
+            logger.error(f"Неожиданная ошибка: {str(e)}", exc_info=True)
+            cleanup()
+            return "", None
+    
+    return "", None
 
 # Создаем базу данных и таблицу, если их нет
 try:

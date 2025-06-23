@@ -1,6 +1,7 @@
 *.csv
 *.log
 *.pdf
+
 user_data.py
 # venv
 myenv/

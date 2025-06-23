@@ -1,74 +1,127 @@
-# Автоматический пересказ решений арбитражных судов,
+# Автоматический пересказ решений арбитражных судов
 # Требуется аккаунт "Контур.Фокуса" для работы
 
-from vkp_pdf import getpdf # Обработка PDF-файлов
-import vkp_db as db # Логика работы с базой данных
-import user_data # Заголовки запроса, включая cookies
+from vkp_pdf import getpdf  # Обработка PDF-файлов
+import vkp_db as db  # Логика работы с базой данных
+import user_data  # Заголовки запроса, включая cookies
 
-from gpt4all import GPT4All #Поддержка ИИ
+from gpt4all import GPT4All  # Поддержка ИИ
 
 import requests
-
-from bs4 import BeautifulSoup  
-
+from bs4 import BeautifulSoup
 from time import sleep
 from tqdm import tqdm
+import logging
+from urllib.parse import urljoin
 
-#Заголовки запроса, включая cookie, подгружаются из файла
-#user_data.py (нет в репозитории, нужно создать и вставить туда словарь
-#headers с нужными переменными (можно взять через отладчик браузера
-#и curlconverter.com)). Отдельные cookies не нужны.
-headers, cookies = user_data.headers, {}
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('arbitr_monitor.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
-print('Загрузка модели')
+def safe_request(url, max_retries=3, retry_delay=5):
+    """Безопасный запрос с повторными попытками"""
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(url, headers=user_data.headers, timeout=30)
+            response.raise_for_status()
+            return response
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"Попытка {attempt + 1}/{max_retries} не удалась: {str(e)}")
+            if attempt < max_retries - 1:
+                sleep(retry_delay * (attempt + 1))
+                continue
+            logger.error(f"Не удалось выполнить запрос к {url} после {max_retries} попыток")
+            raise
 
-# Путь к модели также берётся из файла user_data
-model = GPT4All(user_data.model_path, allow_download=False)
-print('Загрузка выполнена')
+def process_document(link, model):
+    """Обработка одного документа"""
+    try:
+        # Проверяем, был ли уже загружен документ
+        if db.indb(link):
+            logger.info(f"Документ {link} уже в архиве, пропускаем")
+            return None
+        
+        # Загружаем текст из PDF
+        text = getpdf(link, {}, user_data.headers)
+        if not text:
+            logger.error(f"Не удалось извлечь текст из {link}")
+            return None
+        
+        # Проверка релевантности документа
+        if not any(substring in text for substring in ['Санкт-Петербург', 'СПб', 'Ленинград']):
+            logger.info(f"Документ {link} не касается Петербурга")
+            return None
+        
+        if not any(substring in text for substring in ['ешение', 'остановление', 'пределение']):
+            logger.info(f"Документ {link} не является судебным актом")
+            return None
+        
+        # Подготовка текста для GPT
+        text_length = len(text)
+        if text_length > 2000:
+            text4gpt = f"Перескажи коротко текст c указанием истца, ответчика, сути дела и его итогов: {text[:1000]} {text[-1000:]}"
+        else:
+            text4gpt = f"Перескажи коротко текст c указанием истца, ответчика, сути дела и его итогов: {text[:2000]}"
+        
+        logger.info(f"Обработка документа длиной {text_length} символов")
+        
+        # Запрос к GPT
+        logger.info("Отправка запроса к GPT...")
+        txt = ''
+        with model.chat_session():
+            g = model.generate(text4gpt, max_tokens=256, streaming=True)
+            for i, v in enumerate(g):
+                txt += v
+        
+        logger.info(f"Получен ответ длиной {len(txt)} символов")
+        
+        # Сохранение в БД
+        db.todb('arbitr', link, txt)
+        logger.info(f"Документ {link} успешно обработан и сохранен")
+        
+        return txt
+        
+    except Exception as e:
+        logger.error(f"Ошибка при обработке документа {link}: {str(e)}", exc_info=True)
+        return None
 
-response = requests.get('https://focus.kontur.ru/content/mon', headers=headers)
-response.raise_for_status()
+def main():
+    """Основная функция"""
+    try:
+        logger.info('Загрузка модели GPT')
+        model = GPT4All(user_data.model_path, allow_download=False)
+        logger.info('Модель загружена')
+        
+        # Получаем список документов
+        logger.info('Загрузка списка документов с focus.kontur.ru')
+        response = safe_request('https://focus.kontur.ru/content/mon')
+        soup = BeautifulSoup(response.content, "lxml")
+        
+        # Находим все ссылки на документы
+        documents = soup.find_all('a', {'class': 'hover-underline org-changes-document'})
+        logger.info(f"Найдено {len(documents)} документов для обработки")
+        
+        # Обрабатываем документы
+        for doc in tqdm(documents, desc="Обработка документов"):
+            try:
+                link = urljoin('https://focus.kontur.ru', doc['href'])
+                logger.info(f"Обработка документа: {link}")
+                process_document(link, model)
+                sleep(1)  # Пауза между запросами
+            except Exception as e:
+                logger.error(f"Ошибка при обработке документа: {str(e)}", exc_info=True)
+                continue
+                
+    except Exception as e:
+        logger.error(f"Критическая ошибка: {str(e)}", exc_info=True)
+        raise
 
-soup = BeautifulSoup(response.content, "lxml")
-eventtypesall = soup.find_all('a', {'class': 'hover-underline org-changes-document'})
-sleep(1)
-
-for i in tqdm(eventtypesall):
-
-    link="https://focus.kontur.ru" + i['href']
-    
-    #Проверяем, был ли уже загружен документ в архив (тогда пропускаем его, возвращаемся в начало цикла)
-    if db.indb(link): 
-        print ("Документ по ссылке " + link + "уже есть в архиве, пропускаем его")
-        continue
-    text = getpdf(link, cookies, headers)
-    if not 'Санкт-Петербург' in text:
-        print (f'Документ по ссылке {link} не касается Петербурга, пропускаем его')
-        continue
-    if not any(substring in text for substring in ['ешение', 'остановление', 'пределение']):
-        print (f'Документ по ссылке {link} не является решением, пропускаем его')
-        continue
-    #print(text[:1000])
-    if len(text)>2000:
-        text4gpt=f"Перескажи коротко текст c указанием истца, ответчика, сути дела и его итогов: {text[:1000]} {text[-1000:]}"
-        print(len(text4gpt))
-    else:
-        text4gpt=f"Перескажи коротко текст c указанием истца, ответчика, сути дела и его итогов: {text[:2000]}"
-        print(len(text4gpt))
-    print('Ждем GPT')    
-    ln=0
-    with model.chat_session():
-        g=model.generate(text4gpt, max_tokens=256, streaming=True)
-        txt=''
-        for i, v in enumerate(g):
-            print(v, end = "", flush = True)
-            ln=i
-            txt+=v
-    print('Длина ответа: ', ln)        
-    db.todb('arbitr', link, txt)
-    img=''
-    link=''
-    #Отправка в телеграм отключена
-    #vkp_app.vkp_telegram.to_telegram('arbitr', img, link, 'Арбитражное дело', data4telegram)
-
-    sleep(1)  
+if __name__ == "__main__":
+    main()
